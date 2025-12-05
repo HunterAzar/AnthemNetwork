@@ -17,6 +17,7 @@ type Config struct {
 	WiresharkPath string `json:"wireshark_path"`
 	AnthemPath    string `json:"anthem_path"`
 	CapturePath   string `json:"capture_path"`
+	Interface     string `json:"interface"`
 }
 
 const configFile = "network_capture_config.json"
@@ -145,12 +146,18 @@ func main() {
 	config.CapturePath = captureDir
 	fmt.Printf("Capture files will be saved to: %s\n\n", captureDir)
 
+	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
+
+	interfaceNum := selectInterface(tsharkPath, &config)
+	config.Interface = interfaceNum
+	fmt.Printf("Selected interface: %s\n\n", interfaceNum)
+
 	saveConfig(config)
 
 	fmt.Print("Press Enter to start the application and begin capture...")
 	bufio.NewReader(os.Stdin).ReadBytes('\n')
 
-	captureFile := startCapture(wiresharkPath)
+	captureFile := startCapture(wiresharkPath, interfaceNum)
 	defer os.Remove(captureFile)
 
 	startApplication(anthemPath)
@@ -280,12 +287,49 @@ func waitForProcess(name string) uint32 {
 	return 0
 }
 
-func startCapture(wiresharkPath string) string {
+func selectInterface(tsharkPath string, config *Config) string {
+	if config.Interface != "" {
+		fmt.Printf("Previously used interface: %s\n", config.Interface)
+		fmt.Print("Use this interface? (y/n): ")
+
+		var response string
+		fmt.Scanln(&response)
+
+		if strings.ToLower(strings.TrimSpace(response)) == "y" {
+			fmt.Printf("Using interface: %s\n\n", config.Interface)
+			return config.Interface
+		}
+	}
+
+	fmt.Println("\nListing available network interfaces...")
+	cmd := exec.Command(tsharkPath, "-D")
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		fmt.Printf("Error listing interfaces: %v\n", err)
+		fmt.Print("Enter interface number manually: ")
+		var interfaceNum string
+		fmt.Scanln(&interfaceNum)
+		return interfaceNum
+	}
+
+	fmt.Println("Available interfaces:")
+	fmt.Println(string(output))
+
+	fmt.Print("Select interface number: ")
+	var interfaceNum string
+	fmt.Scanln(&interfaceNum)
+
+	return strings.TrimSpace(interfaceNum)
+}
+
+func startCapture(wiresharkPath string, interfaceNum string) string {
 	captureFile := filepath.Join(os.TempDir(), fmt.Sprintf("capture_%d.pcapng", time.Now().Unix()))
 	fmt.Printf("\nStarting Wireshark capture to: %s\n", captureFile)
 
 	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
-	captureCmd := exec.Command(tsharkPath, "-i", "1", "-w", captureFile)
+
+	captureCmd := exec.Command(tsharkPath, "-i", interfaceNum, "-w", captureFile)
 
 	if err := captureCmd.Start(); err != nil {
 		fmt.Printf("Error starting capture: %v\n", err)
@@ -537,8 +581,16 @@ func buildWiresharkFilter(connections map[string]ConnectionInfo) string {
 
 	for _, conn := range connections {
 		if conn.RemoteAddr != "" {
-			filters = append(filters, fmt.Sprintf("(ip.addr == %s and (tcp.port == %d or udp.port == %d))",
-				conn.RemoteAddr, conn.RemotePort, conn.RemotePort))
+			if conn.Protocol == "tcp" {
+				filters = append(filters, fmt.Sprintf("(ip.addr == %s and tcp.port == %d)",
+					conn.RemoteAddr, conn.RemotePort))
+			} else if conn.Protocol == "udp" {
+				filters = append(filters, fmt.Sprintf("(ip.addr == %s and udp.port == %d)",
+					conn.RemoteAddr, conn.RemotePort))
+			} else {
+				filters = append(filters, fmt.Sprintf("((ip.addr == %s and tcp.port == %d) or (ip.addr == %s and udp.port == %d))",
+					conn.RemoteAddr, conn.RemotePort, conn.RemoteAddr, conn.RemotePort))
+			}
 		} else {
 			filters = append(filters, fmt.Sprintf("udp.port == %d", conn.LocalPort))
 		}
