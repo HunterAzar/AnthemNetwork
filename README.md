@@ -9,4 +9,9 @@ Feel free to edit it or whatever
 1. Wireshark installed
 2. Ability to read
 3. Free space on disk
-4. For building install go lang
+
+
+#### Building from source
+1. Install golang
+2. Run `rsrc -manifest captureAnthem.manifest -o rsrc.sys`
+3. Build with `go build -ldflags="-H windowsgui" -o app.exe` or run with `go run -ldflags="-H windowsgui" `
