@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +10,9 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/lxn/walk"
+	. "github.com/lxn/walk/declarative"
 )
 
 type Config struct {
@@ -30,6 +32,7 @@ const (
 var (
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 	iphlpapi = syscall.NewLazyDLL("iphlpapi.dll")
+	comctl32 = syscall.NewLazyDLL("comctl32.dll")
 
 	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
 	procProcess32First           = kernel32.NewProc("Process32FirstW")
@@ -37,7 +40,13 @@ var (
 	procCloseHandle              = kernel32.NewProc("CloseHandle")
 	procGetExtendedTcpTable      = iphlpapi.NewProc("GetExtendedTcpTable")
 	procGetExtendedUdpTable      = iphlpapi.NewProc("GetExtendedUdpTable")
+	procInitCommonControlsEx     = comctl32.NewProc("InitCommonControlsEx")
 )
+
+type INITCOMMONCONTROLSEX struct {
+	dwSize uint32
+	dwICC  uint32
+}
 
 type PROCESSENTRY32 struct {
 	Size              uint32
@@ -74,111 +83,512 @@ type ConnectionInfo struct {
 	Protocol   string
 }
 
+type MyMainWindow struct {
+	*walk.MainWindow
+	wiresharkEdit  *walk.LineEdit
+	anthemEdit     *walk.LineEdit
+	captureEdit    *walk.LineEdit
+	interfaceCombo *walk.ComboBox
+	startBtn       *walk.PushButton
+	logEdit        *walk.TextEdit
+	statusBar      *walk.StatusBarItem
+	config         Config
+	captureFile    string
+	captureCmd     *exec.Cmd
+	isCapturing    bool
+}
+
+func initCommonControls() {
+
+	var icc INITCOMMONCONTROLSEX
+	icc.dwSize = uint32(unsafe.Sizeof(icc))
+	icc.dwICC = 0x0000FFFF
+
+	if procInitCommonControlsEx != nil {
+		ret, _, err := procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
+		if ret == 0 {
+			fmt.Printf("Warning: InitCommonControlsEx failed: %v\n", err)
+		}
+	}
+}
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Panic occurred: %v\n", r)
+			panic(r)
+		}
+	}()
+	initCommonControls()
+
+	mw := &MyMainWindow{
+		config: loadConfig(),
+	}
+
+	if err := (MainWindow{
+		AssignTo: &mw.MainWindow,
+		Title:    "Network Traffic Capture Tool",
+		MinSize:  Size{Width: 800, Height: 600},
+		Layout:   VBox{},
+		StatusBarItems: []StatusBarItem{
+			{
+				AssignTo: &mw.statusBar,
+				Text:     "Ready",
+			},
+		},
+		Children: []Widget{
+			GroupBox{
+				Title:  "Configuration",
+				Layout: Grid{Columns: 3},
+				Children: []Widget{
+					Label{Text: "Wireshark Path:"},
+					LineEdit{
+						AssignTo: &mw.wiresharkEdit,
+						Text:     mw.config.WiresharkPath,
+					},
+					PushButton{
+						Text: "Browse...",
+						OnClicked: func() {
+							dlg := new(walk.FileDialog)
+							dlg.Title = "Select Wireshark.exe"
+							dlg.Filter = "Executable Files (*.exe)|*.exe"
+							if ok, _ := dlg.ShowOpen(mw); ok {
+								mw.wiresharkEdit.SetText(dlg.FilePath)
+							}
+						},
+					},
+
+					Label{Text: "Anthem Path:"},
+					LineEdit{
+						AssignTo: &mw.anthemEdit,
+						Text:     mw.config.AnthemPath,
+					},
+					PushButton{
+						Text: "Browse...",
+						OnClicked: func() {
+							dlg := new(walk.FileDialog)
+							dlg.Title = "Select Anthem.exe"
+							dlg.Filter = "Executable Files (*.exe)|*.exe"
+							if ok, _ := dlg.ShowOpen(mw); ok {
+								mw.anthemEdit.SetText(dlg.FilePath)
+							}
+						},
+					},
+
+					Label{Text: "Capture Directory:"},
+					LineEdit{
+						AssignTo: &mw.captureEdit,
+						Text:     mw.config.CapturePath,
+					},
+					PushButton{
+						Text: "Browse...",
+						OnClicked: func() {
+							dlg := new(walk.FileDialog)
+							dlg.Title = "Select Capture Directory"
+							if ok, _ := dlg.ShowBrowseFolder(mw); ok {
+								mw.captureEdit.SetText(dlg.FilePath)
+							}
+						},
+					},
+
+					Label{Text: "Network Interface:"},
+					ComboBox{
+						AssignTo: &mw.interfaceCombo,
+						Editable: false,
+					},
+					PushButton{
+						Text: "Refresh",
+						OnClicked: func() {
+							mw.refreshInterfaces()
+						},
+					},
+				},
+			},
+
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					PushButton{
+						AssignTo: &mw.startBtn,
+						Text:     "Start Capture",
+						OnClicked: func() {
+							go mw.startCapture()
+						},
+					},
+					HSpacer{},
+				},
+			},
+
+			GroupBox{
+				Title:  "Log",
+				Layout: VBox{},
+				Children: []Widget{
+					TextEdit{
+						AssignTo: &mw.logEdit,
+						ReadOnly: true,
+						VScroll:  true,
+					},
+				},
+			},
+		},
+	}.Create()); err != nil {
+		panic(err)
+	}
+
+	if mw.captureEdit.Text() == "" {
+		mw.captureEdit.SetText(getDefaultCaptureDir())
+	}
+
+	if mw.config.Interface != "" {
+		mw.interfaceCombo.SetText(mw.config.Interface)
+	}
+
+	if mw.config.WiresharkPath != "" {
+		go mw.refreshInterfaces()
+	}
+
+	mw.Run()
+}
+
+func (mw *MyMainWindow) log(message string) {
+	timestamp := time.Now().Format("15:04:05")
+	logMsg := fmt.Sprintf("[%s] %s\r\n", timestamp, message)
+
+	mw.Synchronize(func() {
+		mw.logEdit.AppendText(logMsg)
+	})
+
+	logFile := filepath.Join(getDefaultCaptureDir(), "capture_log.txt")
+
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		defer f.Close()
+		f.WriteString(message + "\n")
+	}
+}
+
+func (mw *MyMainWindow) updateStatus(status string) {
+	mw.Synchronize(func() {
+		mw.statusBar.SetText(status)
+	})
+}
+
+func (mw *MyMainWindow) refreshInterfaces() {
+	wiresharkPath := mw.wiresharkEdit.Text()
+	if wiresharkPath == "" {
+		mw.log("Please set Wireshark path first")
+		return
+	}
+
+	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
+	if _, err := os.Stat(tsharkPath); err != nil {
+		mw.log(fmt.Sprintf("tshark.exe not found at: %s", tsharkPath))
+		return
+	}
+
+	mw.log(fmt.Sprintf("Trying to run tshark at: %s", tsharkPath))
+	cmd := exec.Command(tsharkPath, "-D")
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		mw.log(fmt.Sprintf("Error listing interfaces: %v", err))
+		return
+	}
+
+	lines := strings.Split(string(output), "\n")
+	var interfaces []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			interfaces = append(interfaces, line)
+		}
+	}
+
+	mw.Synchronize(func() {
+
+		mw.interfaceCombo.SetModel([]string{})
+		mw.interfaceCombo.SetModel(interfaces)
+
+		if mw.config.Interface != "" {
+
+			for i, iface := range interfaces {
+				if iface == mw.config.Interface {
+					mw.interfaceCombo.SetCurrentIndex(i)
+					break
+				}
+			}
+		}
+	})
+
+	mw.log("Interfaces refreshed")
+}
+
+func (mw *MyMainWindow) startCapture() {
+
+	wiresharkPath := mw.wiresharkEdit.Text()
+	if wiresharkPath == "" {
+		mw.Synchronize(func() {
+			walk.MsgBox(mw, "Error", "Please select Wireshark path", walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	anthemPath := mw.anthemEdit.Text()
+	if anthemPath == "" {
+		mw.Synchronize(func() {
+			walk.MsgBox(mw, "Error", "Please select Anthem path", walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	captureDir := mw.captureEdit.Text()
+	if captureDir == "" {
+		captureDir = getDefaultCaptureDir()
+	}
+
+	interfaceIdx := mw.interfaceCombo.CurrentIndex()
+	if interfaceIdx < 0 {
+		mw.Synchronize(func() {
+			walk.MsgBox(mw, "Error", "Please select network interface", walk.MsgBoxIconError)
+		})
+		return
+	}
+
+	interfaceFull := mw.interfaceCombo.Text()
+
+	if interfaceFull == "" {
+		mw.log("No network interface selected")
+		return
+	}
+
+	interfaceNum := strings.Fields(interfaceFull)[0]
+	interfaceNum = strings.TrimRight(interfaceNum, ". ")
+
+	mw.log(fmt.Sprintf("Interface full: '%s'", interfaceFull))
+	mw.log(fmt.Sprintf("Interface number: '%s'", interfaceNum))
+
+	mw.config.WiresharkPath = wiresharkPath
+	mw.config.AnthemPath = anthemPath
+	mw.config.CapturePath = captureDir
+	mw.config.Interface = interfaceFull
+	saveConfig(mw.config)
+
+	fmt.Println("Debug 1")
+
+	mw.Synchronize(func() {
+		mw.startBtn.SetEnabled(false)
+	})
+	fmt.Println("Debug 2")
+	mw.updateStatus("Capturing...")
+
+	fmt.Println("Debug 3")
+
+	mw.runCapture(wiresharkPath, anthemPath, captureDir, interfaceNum)
+
+	fmt.Println("Debug 4")
+
+	mw.Synchronize(func() {
+		fmt.Println("Debug 5")
+		mw.startBtn.SetEnabled(true)
+	})
+	fmt.Println("Debug 6")
+	mw.updateStatus("Ready")
+	fmt.Println("Debug 7")
+}
+
+func (mw *MyMainWindow) runCapture(wiresharkPath, anthemPath, captureDir, interfaceNum string) {
+	defer func() {
+		if r := recover(); r != nil {
+			mw.log(fmt.Sprintf("Panic in runCapture: %v", r))
+			if mw.captureCmd != nil && mw.captureCmd.Process != nil {
+				mw.captureCmd.Process.Kill()
+			}
+		}
+	}()
+
+	if err := os.MkdirAll(captureDir, 0755); err != nil {
+		mw.log(fmt.Sprintf("Error creating capture directory: %v", err))
+		return
+	}
+
+	mw.captureFile = filepath.Join(os.TempDir(), fmt.Sprintf("capture_%d.pcapng", time.Now().Unix()))
+	mw.log(fmt.Sprintf("Starting capture to: %s", mw.captureFile))
+
+	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
+
+	if _, err := os.Stat(tsharkPath); os.IsNotExist(err) {
+		mw.log(fmt.Sprintf("tshark.exe not found at: %s", tsharkPath))
+		return
+	}
+
+	mw.captureCmd = exec.Command(tsharkPath, "-i", interfaceNum, "-w", mw.captureFile)
+
+	if err := mw.captureCmd.Start(); err != nil {
+		mw.log(fmt.Sprintf("Error starting capture: %v", err))
+		return
+	}
+
+	mw.isCapturing = true
+	go func() {
+		err := mw.captureCmd.Wait()
+		if err != nil {
+			mw.log(fmt.Sprintf("Capture process ended with error: %v", err))
+		}
+		mw.isCapturing = false
+	}()
+
+	time.Sleep(2 * time.Second)
+	mw.log("Capture started!")
+
+	if _, err := os.Stat(anthemPath); os.IsNotExist(err) {
+		mw.log(fmt.Sprintf("Anthem.exe not found at: %s", anthemPath))
+		return
+	}
+
+	mw.log("Launching Anthem...")
+	appCmd := exec.Command(anthemPath)
+
+	if err := appCmd.Start(); err != nil {
+		mw.log(fmt.Sprintf("Error starting Anthem: %v", err))
+		if mw.captureCmd != nil && mw.captureCmd.Process != nil {
+			mw.captureCmd.Process.Kill()
+		}
+		return
+	}
+
+	mw.log("Waiting for Anthem.exe process...")
+	appPID := mw.waitForProcess("Anthem.exe")
+	if appPID == 0 {
+		mw.log("Error: Could not find Anthem.exe process")
+		if mw.captureCmd != nil && mw.captureCmd.Process != nil {
+			mw.captureCmd.Process.Kill()
+		}
+		return
+	}
+
+	mw.log(fmt.Sprintf("Found Anthem.exe with PID: %d", appPID))
+	mw.log("Monitoring connections... Close Anthem to stop.")
+
+	connections := mw.monitorConnections("Anthem.exe", appPID)
+
+	mw.log("Stopping capture...")
+	if mw.captureCmd != nil && mw.captureCmd.Process != nil {
+		mw.captureCmd.Process.Kill()
+	}
+	time.Sleep(1 * time.Second)
+
+	if len(connections) > 0 {
+		mw.log(fmt.Sprintf("Found %d unique connections", len(connections)))
+		mw.filterAndSave(wiresharkPath, captureDir, connections)
+	} else {
+		mw.log("No connections captured")
+	}
+
+	if mw.captureFile != "" {
+		os.Remove(mw.captureFile)
+	}
+
+	mw.log("Capture complete!")
+	mw.updateStatus("Capture complete")
+}
+
+func (mw *MyMainWindow) waitForProcess(name string) uint32 {
+	for i := 0; i < 30; i++ {
+		pid := findProcessByName(name)
+		if pid != 0 {
+			return pid
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return 0
+}
+
+func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) map[string]ConnectionInfo {
+	connections := make(map[string]ConnectionInfo)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	pid := initialPID
+
+	timeout := time.After(5 * time.Minute)
+
+	for {
+		select {
+		case <-timeout:
+			mw.log("Monitoring timeout reached")
+			return connections
+		case <-ticker.C:
+			currentPID := findProcessByName(procName)
+
+			if currentPID == 0 {
+				mw.log(fmt.Sprintf("%s not found, waiting...", procName))
+				waitForProcessTimeout := time.After(15 * time.Second)
+				checkTicker := time.NewTicker(500 * time.Millisecond)
+
+				processFound := false
+				for !processFound {
+					select {
+					case <-waitForProcessTimeout:
+						checkTicker.Stop()
+						mw.log(fmt.Sprintf("%s is no longer running", procName))
+						return connections
+					case <-checkTicker.C:
+						currentPID = findProcessByName(procName)
+						if currentPID != 0 {
+							checkTicker.Stop()
+							mw.log(fmt.Sprintf("Process %s found again with PID %d", procName, currentPID))
+							pid = currentPID
+							processFound = true
+						}
+					}
+				}
+				continue
+			}
+
+			if currentPID != pid {
+				mw.log(fmt.Sprintf("Detected PID change: %d -> %d", pid, currentPID))
+				pid = currentPID
+			}
+
+			newConns := getProcessConnections(pid)
+			for key, conn := range newConns {
+				if _, exists := connections[key]; !exists {
+					connections[key] = conn
+					if conn.RemoteAddr != "" {
+						mw.log(fmt.Sprintf("New connection: %s -> %s:%d", conn.Protocol, conn.RemoteAddr, conn.RemotePort))
+					} else {
+						mw.log(fmt.Sprintf("New connection: %s port %d", conn.Protocol, conn.LocalPort))
+					}
+				}
+			}
+		}
+	}
+}
+
+func (mw *MyMainWindow) filterAndSave(wiresharkPath, captureDir string, connections map[string]ConnectionInfo) {
+	filter := buildWiresharkFilter(connections)
+	mw.log(fmt.Sprintf("Filter: %s", filter))
+
+	outputFile := filepath.Join(captureDir, fmt.Sprintf("anthem_filtered_%d.pcapng", time.Now().Unix()))
+	mw.log(fmt.Sprintf("Saving to: %s", outputFile))
+
+	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
+	filterCmd := exec.Command(tsharkPath, "-r", mw.captureFile, "-Y", filter, "-w", outputFile)
+
+	if err := filterCmd.Run(); err != nil {
+		mw.log(fmt.Sprintf("Error filtering capture: %v", err))
+		return
+	}
+
+	mw.log("Filtered capture saved successfully!")
+	mw.log(fmt.Sprintf("Output: %s", outputFile))
+}
+
 func getDefaultCaptureDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "."
 	}
 	return filepath.Join(home, "Desktop", "AnthemNetworkCaptures")
-}
-
-func getValidatedDir(name, savedPath, defaultPath string) string {
-	reader := bufio.NewReader(os.Stdin)
-
-	if savedPath != "" {
-		if info, err := os.Stat(savedPath); err == nil && info.IsDir() {
-			fmt.Printf("Found saved %s directory: %s\n", name, savedPath)
-			fmt.Print("Use this directory? (Y/n): ")
-			response, _ := reader.ReadString('\n')
-			response = strings.TrimSpace(strings.ToLower(response))
-			if response == "" || response == "y" || response == "yes" {
-				return savedPath
-			}
-		} else {
-			fmt.Printf("Saved %s directory no longer exists: %s\n", name, savedPath)
-		}
-	}
-
-	if defaultPath != "" {
-		fmt.Printf("Enter %s directory (or press Enter for default):\n[%s]\n> ", name, defaultPath)
-	} else {
-		fmt.Printf("Enter %s directory:\n> ", name)
-	}
-
-	for {
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "" && defaultPath != "" {
-			input = defaultPath
-		}
-
-		if input != "" {
-
-			err := os.MkdirAll(input, 0755)
-			if err == nil {
-				return input
-			}
-			fmt.Printf("Could not create directory: %s (%v)\n", input, err)
-		}
-
-		fmt.Printf("Please enter a valid %s directory: ", name)
-	}
-}
-
-func main() {
-	fmt.Println("=== Windows Network Traffic Capture Tool ===\n")
-
-	config := loadConfig()
-
-	wiresharkPath := getValidatedPath("Wireshark", config.WiresharkPath,
-		`C:\Program Files\Wireshark\Wireshark.exe`)
-	config.WiresharkPath = wiresharkPath
-	fmt.Printf("Using Wireshark: %s\n", wiresharkPath)
-
-	anthemPath := getValidatedPath("Anthem", config.AnthemPath,
-		`C:\Program Files (x86)\Origin Games\Anthem\Anthem.exe`)
-	config.AnthemPath = anthemPath
-	fmt.Printf("Using Anthem: %s\n\n", anthemPath)
-
-	captureDirDefault := getDefaultCaptureDir()
-	captureDir := getValidatedDir("capture output", config.CapturePath, captureDirDefault)
-	config.CapturePath = captureDir
-	fmt.Printf("Capture files will be saved to: %s\n\n", captureDir)
-
-	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
-
-	interfaceNum := selectInterface(tsharkPath, &config)
-	config.Interface = interfaceNum
-	fmt.Printf("Selected interface: %s\n\n", interfaceNum)
-
-	saveConfig(config)
-
-	fmt.Print("Press Enter to start the application and begin capture...")
-	bufio.NewReader(os.Stdin).ReadBytes('\n')
-
-	captureFile := startCapture(wiresharkPath, interfaceNum)
-	defer os.Remove(captureFile)
-
-	startApplication(anthemPath)
-
-	appPID := waitForProcess("Anthem.exe")
-	time.Sleep(1 * time.Second)
-	if appPID == 0 {
-		fmt.Println("Error: Could not find Anthem.exe process")
-		return
-	}
-	fmt.Printf("Found Anthem.exe with PID: %d\n\n", appPID)
-
-	connections := monitorConnections("Anthem.exe", appPID)
-
-	stopCapture()
-
-	if len(connections) > 0 {
-		filterAndSave(wiresharkPath, captureFile, captureDir, connections)
-	} else {
-		fmt.Println("\nNo connections captured. Exiting.")
-	}
 }
 
 func loadConfig() Config {
@@ -192,57 +602,8 @@ func loadConfig() Config {
 }
 
 func saveConfig(config Config) {
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		fmt.Printf("Warning: Could not save config: %v\n", err)
-		return
-	}
-	if err := os.WriteFile(configFile, data, 0644); err != nil {
-		fmt.Printf("Warning: Could not write config file: %v\n", err)
-	}
-}
-
-func getValidatedPath(name, savedPath, defaultPath string) string {
-	reader := bufio.NewReader(os.Stdin)
-
-	if savedPath != "" {
-		if _, err := os.Stat(savedPath); err == nil {
-			fmt.Printf("Found saved %s path: %s\n", name, savedPath)
-			fmt.Print("Use this path? (Y/n): ")
-			response, _ := reader.ReadString('\n')
-			response = strings.TrimSpace(strings.ToLower(response))
-			if response == "" || response == "y" || response == "yes" {
-				return savedPath
-			}
-		} else {
-			fmt.Printf("Saved %s path no longer exists: %s\n", name, savedPath)
-		}
-	}
-
-	if _, err := os.Stat(defaultPath); err == nil {
-		fmt.Printf("Enter %s path (or press Enter for default):\n[%s]\n> ", name, defaultPath)
-	} else {
-		fmt.Printf("Enter %s path:\n> ", name)
-		defaultPath = ""
-	}
-
-	for {
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-
-		if input == "" && defaultPath != "" {
-			return defaultPath
-		}
-
-		if input != "" {
-			if _, err := os.Stat(input); err == nil {
-				return input
-			}
-			fmt.Printf("Path does not exist: %s\n", input)
-		}
-
-		fmt.Printf("Please enter a valid %s path: ", name)
-	}
+	data, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFile, data, 0644)
 }
 
 func findProcessByName(name string) uint32 {
@@ -273,178 +634,6 @@ func findProcessByName(name string) uint32 {
 	}
 
 	return 0
-}
-
-func waitForProcess(name string) uint32 {
-	fmt.Printf("Waiting for %s process to start...\n", name)
-	for i := 0; i < 30; i++ {
-		pid := findProcessByName(name)
-		if pid != 0 {
-			return pid
-		}
-		time.Sleep(1 * time.Second)
-	}
-	return 0
-}
-
-func selectInterface(tsharkPath string, config *Config) string {
-	if config.Interface != "" {
-		fmt.Printf("Previously used interface: %s\n", config.Interface)
-		fmt.Print("Use this interface? (y/n): ")
-
-		var response string
-		fmt.Scanln(&response)
-
-		if strings.ToLower(strings.TrimSpace(response)) == "y" {
-			fmt.Printf("Using interface: %s\n\n", config.Interface)
-			return config.Interface
-		}
-	}
-
-	fmt.Println("\nListing available network interfaces...")
-	cmd := exec.Command(tsharkPath, "-D")
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		fmt.Printf("Error listing interfaces: %v\n", err)
-		fmt.Print("Enter interface number manually: ")
-		var interfaceNum string
-		fmt.Scanln(&interfaceNum)
-		return interfaceNum
-	}
-
-	fmt.Println("Available interfaces:")
-	fmt.Println(string(output))
-
-	fmt.Print("Select interface number: ")
-	var interfaceNum string
-	fmt.Scanln(&interfaceNum)
-
-	return strings.TrimSpace(interfaceNum)
-}
-
-func startCapture(wiresharkPath string, interfaceNum string) string {
-	captureFile := filepath.Join(os.TempDir(), fmt.Sprintf("capture_%d.pcapng", time.Now().Unix()))
-	fmt.Printf("\nStarting Wireshark capture to: %s\n", captureFile)
-
-	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
-
-	captureCmd := exec.Command(tsharkPath, "-i", interfaceNum, "-w", captureFile)
-
-	if err := captureCmd.Start(); err != nil {
-		fmt.Printf("Error starting capture: %v\n", err)
-		os.Exit(1)
-	}
-
-	go func() {
-		captureCmd.Wait()
-	}()
-
-	time.Sleep(2 * time.Second)
-	fmt.Println("Capture started!\n")
-
-	return captureFile
-}
-
-func stopCapture() {
-	fmt.Println("\nApplication closed. Stopping capture...")
-
-	time.Sleep(1 * time.Second)
-}
-
-func startApplication(anthemPath string) *exec.Cmd {
-	fmt.Println("Launching application...")
-	appCmd := exec.Command(anthemPath)
-	if err := appCmd.Start(); err != nil {
-		fmt.Printf("Error starting application: %v\n", err)
-		os.Exit(1)
-	}
-	return appCmd
-}
-
-func monitorConnections(procName string, initialPID uint32) map[string]ConnectionInfo {
-	connections := make(map[string]ConnectionInfo)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	pid := initialPID
-
-	if pid == 0 {
-		fmt.Printf("Process %s not found. Waiting up to 15 seconds for it to start...\n", procName)
-		timeout := time.After(60 * time.Second)
-		checkTicker := time.NewTicker(500 * time.Millisecond)
-		defer checkTicker.Stop()
-
-		processFound := false
-		for !processFound {
-			select {
-			case <-timeout:
-				fmt.Printf("Timeout: %s did not start within 15 seconds.\n", procName)
-				return connections
-			case <-checkTicker.C:
-				pid = findProcessByName(procName)
-				if pid != 0 {
-					fmt.Printf("Process %s found with PID %d. Starting monitoring...\n", procName, pid)
-					processFound = true
-				}
-			}
-		}
-	}
-
-	fmt.Println("Monitoring network connections...")
-	fmt.Println("Close the application to stop monitoring and filter capture.\n")
-
-	for {
-		select {
-		case <-ticker.C:
-
-			currentPID := findProcessByName(procName)
-
-			if currentPID == 0 {
-				fmt.Printf("%s not found. Waiting up to 15 seconds for it to restart...\n", procName)
-				timeout := time.After(15 * time.Second)
-				checkTicker := time.NewTicker(500 * time.Millisecond)
-
-				processFound := false
-				for !processFound {
-					select {
-					case <-timeout:
-						checkTicker.Stop()
-						fmt.Printf("%s is no longer running. Stopping monitoring.\n", procName)
-						return connections
-					case <-checkTicker.C:
-						currentPID = findProcessByName(procName)
-						if currentPID != 0 {
-							checkTicker.Stop()
-							fmt.Printf("Process %s found again with PID %d. Resuming monitoring...\n", procName, currentPID)
-							pid = currentPID
-							processFound = true
-						}
-					}
-				}
-				continue
-			}
-
-			if currentPID != pid {
-				fmt.Printf("Detected PID change for %s: %d -> %d\n", procName, pid, currentPID)
-				pid = currentPID
-			}
-
-			newConns := getProcessConnections(pid)
-			for key, conn := range newConns {
-				if _, exists := connections[key]; !exists {
-					connections[key] = conn
-					if conn.RemoteAddr != "" {
-						fmt.Printf("New connection (PID %d): %s -> %s:%d\n",
-							pid, conn.Protocol, conn.RemoteAddr, conn.RemotePort)
-					} else {
-						fmt.Printf("New connection (PID %d): %s port %d\n",
-							pid, conn.Protocol, conn.LocalPort)
-					}
-				}
-			}
-		}
-	}
 }
 
 func getProcessConnections(pid uint32) map[string]ConnectionInfo {
@@ -540,57 +729,14 @@ func formatIP(ip uint32) string {
 		byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24))
 }
 
-func filterAndSave(wiresharkPath, captureFile, captureDir string, connections map[string]ConnectionInfo) {
-
-	if err := os.MkdirAll(captureDir, 0755); err != nil {
-		fmt.Printf("Error creating capture directory %s: %v\n", captureDir, err)
-		fmt.Printf("Falling back to current directory.\n")
-		captureDir = "."
-	}
-
-	fmt.Printf("\nFound %d unique connections\n", len(connections))
-	fmt.Println("Building Wireshark filter...")
-
-	filter := buildWiresharkFilter(connections)
-	fmt.Printf("Filter: %s\n\n", filter)
-
-	outputFile := filepath.Join(
-		captureDir,
-		fmt.Sprintf("anthem_filtered_%d.pcapng", time.Now().Unix()),
-	)
-	fmt.Printf("Filtering capture and saving to: %s\n", outputFile)
-
-	tsharkPath := filepath.Join(filepath.Dir(wiresharkPath), "tshark.exe")
-	filterCmd := exec.Command(tsharkPath,
-		"-r", captureFile,
-		"-Y", filter,
-		"-w", outputFile)
-
-	if err := filterCmd.Run(); err != nil {
-		fmt.Printf("Error filtering capture: %v\n", err)
-		fmt.Printf("Original capture saved at: %s\n", captureFile)
-		return
-	}
-
-	fmt.Println("Filtered capture saved successfully!")
-	fmt.Printf("\nDone! Filtered capture: %s\n", outputFile)
-}
-
 func buildWiresharkFilter(connections map[string]ConnectionInfo) string {
 	var filters []string
 
 	for _, conn := range connections {
 		if conn.RemoteAddr != "" {
-			if conn.Protocol == "tcp" {
-				filters = append(filters, fmt.Sprintf("(ip.addr == %s and tcp.port == %d)",
-					conn.RemoteAddr, conn.RemotePort))
-			} else if conn.Protocol == "udp" {
-				filters = append(filters, fmt.Sprintf("(ip.addr == %s and udp.port == %d)",
-					conn.RemoteAddr, conn.RemotePort))
-			} else {
-				filters = append(filters, fmt.Sprintf("((ip.addr == %s and tcp.port == %d) or (ip.addr == %s and udp.port == %d))",
-					conn.RemoteAddr, conn.RemotePort, conn.RemoteAddr, conn.RemotePort))
-			}
+			protocol := strings.ToLower(conn.Protocol)
+			filters = append(filters, fmt.Sprintf("(ip.addr == %s and %s.port == %d)",
+				conn.RemoteAddr, protocol, conn.RemotePort))
 		} else {
 			filters = append(filters, fmt.Sprintf("udp.port == %d", conn.LocalPort))
 		}
