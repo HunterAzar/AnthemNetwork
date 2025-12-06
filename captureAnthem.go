@@ -38,6 +38,8 @@ var (
 	procProcess32First           = kernel32.NewProc("Process32FirstW")
 	procProcess32Next            = kernel32.NewProc("Process32NextW")
 	procCloseHandle              = kernel32.NewProc("CloseHandle")
+	procOpenProcess              = kernel32.NewProc("OpenProcess")
+	procTerminateProcess         = kernel32.NewProc("TerminateProcess")
 	procGetExtendedTcpTable      = iphlpapi.NewProc("GetExtendedTcpTable")
 	procGetExtendedUdpTable      = iphlpapi.NewProc("GetExtendedUdpTable")
 	procInitCommonControlsEx     = comctl32.NewProc("InitCommonControlsEx")
@@ -90,16 +92,20 @@ type MyMainWindow struct {
 	captureEdit    *walk.LineEdit
 	interfaceCombo *walk.ComboBox
 	startBtn       *walk.PushButton
+	stopCaptureBtn *walk.PushButton
+	stopBothBtn    *walk.PushButton
 	logEdit        *walk.TextEdit
 	statusBar      *walk.StatusBarItem
 	config         Config
 	captureFile    string
 	captureCmd     *exec.Cmd
 	isCapturing    bool
+	stopCapture    chan bool
+	anthemPID      uint32
+	connections    map[string]ConnectionInfo
 }
 
 func initCommonControls() {
-
 	var icc INITCOMMONCONTROLSEX
 	icc.dwSize = uint32(unsafe.Sizeof(icc))
 	icc.dwICC = 0x0000FFFF
@@ -111,6 +117,7 @@ func initCommonControls() {
 		}
 	}
 }
+
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -121,7 +128,9 @@ func main() {
 	initCommonControls()
 
 	mw := &MyMainWindow{
-		config: loadConfig(),
+		config:      loadConfig(),
+		stopCapture: make(chan bool),
+		connections: make(map[string]ConnectionInfo),
 	}
 
 	if err := (MainWindow{
@@ -214,6 +223,22 @@ func main() {
 							go mw.startCapture()
 						},
 					},
+					PushButton{
+						AssignTo: &mw.stopCaptureBtn,
+						Text:     "Stop Capture Only",
+						Enabled:  false,
+						OnClicked: func() {
+							go mw.stopCaptureOnly()
+						},
+					},
+					PushButton{
+						AssignTo: &mw.stopBothBtn,
+						Text:     "Stop Capture & Close Anthem",
+						Enabled:  false,
+						OnClicked: func() {
+							go mw.stopCaptureAndCloseAnthem()
+						},
+					},
 					HSpacer{},
 				},
 			},
@@ -268,7 +293,9 @@ func (mw *MyMainWindow) log(message string) {
 
 func (mw *MyMainWindow) updateStatus(status string) {
 	mw.Synchronize(func() {
-		mw.statusBar.SetText(status)
+		if mw.statusBar != nil {
+			mw.statusBar.SetText(status)
+		}
 	})
 }
 
@@ -304,12 +331,10 @@ func (mw *MyMainWindow) refreshInterfaces() {
 	}
 
 	mw.Synchronize(func() {
-
 		mw.interfaceCombo.SetModel([]string{})
 		mw.interfaceCombo.SetModel(interfaces)
 
 		if mw.config.Interface != "" {
-
 			for i, iface := range interfaces {
 				if iface == mw.config.Interface {
 					mw.interfaceCombo.SetCurrentIndex(i)
@@ -322,8 +347,23 @@ func (mw *MyMainWindow) refreshInterfaces() {
 	mw.log("Interfaces refreshed")
 }
 
-func (mw *MyMainWindow) startCapture() {
+func (mw *MyMainWindow) stopCaptureOnly() {
+	mw.log("Stopping capture only...")
+	select {
+	case mw.stopCapture <- false:
+	default:
+	}
+}
 
+func (mw *MyMainWindow) stopCaptureAndCloseAnthem() {
+	mw.log("Stopping capture and closing Anthem...")
+	select {
+	case mw.stopCapture <- true:
+	default:
+	}
+}
+
+func (mw *MyMainWindow) startCapture() {
 	wiresharkPath := mw.wiresharkEdit.Text()
 	if wiresharkPath == "" {
 		mw.Synchronize(func() {
@@ -372,27 +412,21 @@ func (mw *MyMainWindow) startCapture() {
 	mw.config.Interface = interfaceFull
 	saveConfig(mw.config)
 
-	fmt.Println("Debug 1")
-
 	mw.Synchronize(func() {
 		mw.startBtn.SetEnabled(false)
+		mw.stopCaptureBtn.SetEnabled(true)
+		mw.stopBothBtn.SetEnabled(true)
 	})
-	fmt.Println("Debug 2")
 	mw.updateStatus("Capturing...")
-
-	fmt.Println("Debug 3")
 
 	mw.runCapture(wiresharkPath, anthemPath, captureDir, interfaceNum)
 
-	fmt.Println("Debug 4")
-
 	mw.Synchronize(func() {
-		fmt.Println("Debug 5")
 		mw.startBtn.SetEnabled(true)
+		mw.stopCaptureBtn.SetEnabled(false)
+		mw.stopBothBtn.SetEnabled(false)
 	})
-	fmt.Println("Debug 6")
 	mw.updateStatus("Ready")
-	fmt.Println("Debug 7")
 }
 
 func (mw *MyMainWindow) runCapture(wiresharkPath, anthemPath, captureDir, interfaceNum string) {
@@ -465,30 +499,12 @@ func (mw *MyMainWindow) runCapture(wiresharkPath, anthemPath, captureDir, interf
 		return
 	}
 
+	mw.anthemPID = appPID
 	mw.log(fmt.Sprintf("Found Anthem.exe with PID: %d", appPID))
-	mw.log("Monitoring connections... Close Anthem to stop.")
+	mw.log("Monitoring connections... Use stop buttons to finish.")
 
-	connections := mw.monitorConnections("Anthem.exe", appPID)
-
-	mw.log("Stopping capture...")
-	if mw.captureCmd != nil && mw.captureCmd.Process != nil {
-		mw.captureCmd.Process.Kill()
-	}
-	time.Sleep(1 * time.Second)
-
-	if len(connections) > 0 {
-		mw.log(fmt.Sprintf("Found %d unique connections", len(connections)))
-		mw.filterAndSave(wiresharkPath, captureDir, connections)
-	} else {
-		mw.log("No connections captured")
-	}
-
-	if mw.captureFile != "" {
-		os.Remove(mw.captureFile)
-	}
-
-	mw.log("Capture complete!")
-	mw.updateStatus("Capture complete")
+	mw.connections = make(map[string]ConnectionInfo)
+	mw.monitorConnections("Anthem.exe", appPID)
 }
 
 func (mw *MyMainWindow) waitForProcess(name string) uint32 {
@@ -502,20 +518,29 @@ func (mw *MyMainWindow) waitForProcess(name string) uint32 {
 	return 0
 }
 
-func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) map[string]ConnectionInfo {
-	connections := make(map[string]ConnectionInfo)
+func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	pid := initialPID
-
 	timeout := time.After(5 * time.Minute)
 
 	for {
 		select {
+		case closeAnthem := <-mw.stopCapture:
+			mw.log("Stop signal received")
+			if closeAnthem {
+				mw.log("Closing Anthem...")
+				terminateProcess(pid)
+			}
+			mw.finalizeCapture()
+			return
+
 		case <-timeout:
 			mw.log("Monitoring timeout reached")
-			return connections
+			mw.finalizeCapture()
+			return
+
 		case <-ticker.C:
 			currentPID := findProcessByName(procName)
 
@@ -530,7 +555,8 @@ func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) m
 					case <-waitForProcessTimeout:
 						checkTicker.Stop()
 						mw.log(fmt.Sprintf("%s is no longer running", procName))
-						return connections
+						mw.finalizeCapture()
+						return
 					case <-checkTicker.C:
 						currentPID = findProcessByName(procName)
 						if currentPID != 0 {
@@ -551,8 +577,8 @@ func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) m
 
 			newConns := getProcessConnections(pid)
 			for key, conn := range newConns {
-				if _, exists := connections[key]; !exists {
-					connections[key] = conn
+				if _, exists := mw.connections[key]; !exists {
+					mw.connections[key] = conn
 					if conn.RemoteAddr != "" {
 						mw.log(fmt.Sprintf("New connection: %s -> %s:%d", conn.Protocol, conn.RemoteAddr, conn.RemotePort))
 					} else {
@@ -562,6 +588,33 @@ func (mw *MyMainWindow) monitorConnections(procName string, initialPID uint32) m
 			}
 		}
 	}
+}
+
+func (mw *MyMainWindow) finalizeCapture() {
+	mw.log("Stopping capture...")
+	if mw.captureCmd != nil && mw.captureCmd.Process != nil {
+		mw.captureCmd.Process.Kill()
+	}
+	time.Sleep(1 * time.Second)
+
+	if len(mw.connections) > 0 {
+		mw.log(fmt.Sprintf("Found %d unique connections", len(mw.connections)))
+		captureDir := mw.captureEdit.Text()
+		if captureDir == "" {
+			captureDir = getDefaultCaptureDir()
+		}
+		wiresharkPath := mw.wiresharkEdit.Text()
+		mw.filterAndSave(wiresharkPath, captureDir, mw.connections)
+	} else {
+		mw.log("No connections captured")
+	}
+
+	if mw.captureFile != "" {
+		os.Remove(mw.captureFile)
+	}
+
+	mw.log("Capture complete!")
+	mw.updateStatus("Capture complete")
 }
 
 func (mw *MyMainWindow) filterAndSave(wiresharkPath, captureDir string, connections map[string]ConnectionInfo) {
@@ -634,6 +687,17 @@ func findProcessByName(name string) uint32 {
 	}
 
 	return 0
+}
+
+func terminateProcess(pid uint32) bool {
+	handle, _, _ := procOpenProcess.Call(PROCESS_ALL_ACCESS, 0, uintptr(pid))
+	if handle == 0 {
+		return false
+	}
+	defer procCloseHandle.Call(handle)
+
+	ret, _, _ := procTerminateProcess.Call(handle, 0)
+	return ret != 0
 }
 
 func getProcessConnections(pid uint32) map[string]ConnectionInfo {
